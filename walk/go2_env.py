@@ -1,4 +1,4 @@
-"""README 第 4 步：将 Go2 仿真封装成最小 Gymnasium 环境。"""
+"""Go2 的 Gymnasium 环境及站立奖励。"""
 
 from pathlib import Path
 
@@ -15,6 +15,19 @@ else:
 SCENE_PATH = Path(__file__).resolve().parents[1] / "xmls" / "scene_go2.xml"
 KP = 200.0
 KD = 5.0
+REWARD_REFERENCE_DT = 0.02  # 站立奖励的权重以 20 ms 为单位
+HEIGHT_REWARD_WIDTH = 0.06  # m
+LINEAR_SPEED_SCALE = 0.5  # m/s
+ANGULAR_SPEED_SCALE = 1.0  # rad/s
+REWARD_WEIGHTS = {
+    "alive": 0.20,
+    "upright": 0.65,
+    "height": 0.35,
+    "body_motion": -0.15,
+    "torque": -0.10,
+    "action_change": -0.05,
+    "failure": -1.00,
+}
 NUMERIC_WARNINGS = (
     mujoco.mjtWarning.mjWARN_BADQPOS,
     mujoco.mjtWarning.mjWARN_BADQVEL,
@@ -27,7 +40,7 @@ class Go2Env(gym.Env):
     """输入 12 维关节动作，输出 48 维观测。每个回合从 home 开始。"""
 
     def __init__(self, *, decimation=10, max_episode_steps=500,
-                 action_scale=0.1, reset_noise_scale=0.01):
+                 action_scale=0.1, reset_noise_scale=0.01, reset_tilt_deg=0.0):
         super().__init__()
         for name, value in (("decimation", decimation),
                             ("max_episode_steps", max_episode_steps)):
@@ -37,6 +50,8 @@ class Go2Env(gym.Env):
                             ("reset_noise_scale", reset_noise_scale)):
             if not np.isfinite(value) or value < 0:
                 raise ValueError(f"{name} 必须是非负有限数值")
+        if not 0 <= reset_tilt_deg < 60:
+            raise ValueError("reset_tilt_deg 必须在 [0, 60) 内")
 
         self.model = mujoco.MjModel.from_xml_path(str(SCENE_PATH))
         self.data = mujoco.MjData(self.model)
@@ -52,16 +67,18 @@ class Go2Env(gym.Env):
         self.q_default = self.model.key_qpos[self.home_id, self.qpos_ids].copy()
         self.joint_limits = self.model.jnt_range[joint_ids]
         self.torque_limits = self.model.actuator_ctrlrange
+        self.torque_capacity = np.max(np.abs(self.torque_limits), axis=1)
 
         self.decimation = decimation
         self.control_dt = self.model.opt.timestep * decimation
         self.max_episode_steps = max_episode_steps
         self.action_scale = action_scale
         self.reset_noise_scale = reset_noise_scale
+        self.reset_tilt_deg = reset_tilt_deg
 
         # 平地 z=0。home 时机身 z=0.27 m，零动作站立约为 0.27～0.28 m。
-        home_height = self.model.key_qpos[self.home_id, self.base_qpos_id + 2]
-        self.min_base_height = 0.5 * home_height
+        self.home_height = float(self.model.key_qpos[self.home_id, self.base_qpos_id + 2])
+        self.min_base_height = 0.5 * self.home_height
         self.min_upright = np.cos(np.deg2rad(60.0))
         self.base_rotation = np.empty(9)
 
@@ -79,7 +96,7 @@ class Go2Env(gym.Env):
         super().reset(seed=seed)
         mujoco.mj_resetDataKeyframe(self.model, self.data, self.home_id)
 
-        # 先恢复 home，再给电机关节角度加可复现的小扰动。设为 0 可精确恢复 home。
+        # 恢复 home，再用环境自己的随机数生成可复现的关节和机身扰动。
         if self.reset_noise_scale > 0:
             noise = self.np_random.uniform(
                 -self.reset_noise_scale, self.reset_noise_scale, size=12
@@ -87,6 +104,12 @@ class Go2Env(gym.Env):
             self.data.qpos[self.qpos_ids] = np.clip(
                 self.q_default + noise, self.joint_limits[:, 0], self.joint_limits[:, 1]
             )
+        if self.reset_tilt_deg > 0:
+            direction = self.np_random.uniform(0, 2 * np.pi)
+            tilt = np.deg2rad(self.np_random.uniform(0, self.reset_tilt_deg))
+            axis = np.array([np.cos(direction), np.sin(direction), 0.0])
+            quat = self.data.qpos[self.base_qpos_id + 3:self.base_qpos_id + 7]
+            mujoco.mju_quatIntegrate(quat, axis, tilt)
         self.data.ctrl.fill(0)
         self.last_action.fill(0)
         self.command.fill(0)
@@ -111,14 +134,19 @@ class Go2Env(gym.Env):
                          self.joint_limits[:, 0], self.joint_limits[:, 1])
         reason = self._termination_reason()
         physics_steps = 0
+        torque_cost_sum = 0.0
+        torque_abs_sum = 0.0
         for _ in range(self.decimation):
             if reason is not None:
                 break
             q = self.data.qpos[self.qpos_ids]
             dq = self.data.qvel[self.dof_ids]
             torque = KP * (target - q) - KD * dq
-            self.data.ctrl[:] = np.clip(torque, self.torque_limits[:, 0],
-                                       self.torque_limits[:, 1])
+            applied_torque = np.clip(torque, self.torque_limits[:, 0],
+                                     self.torque_limits[:, 1])
+            self.data.ctrl[:] = applied_torque
+            torque_cost_sum += np.mean((applied_torque / self.torque_capacity) ** 2)
+            torque_abs_sum += np.mean(np.abs(applied_torque))
             previous_time = self.data.time
             mujoco.mj_step(self.model, self.data)
             physics_steps += 1
@@ -131,6 +159,10 @@ class Go2Env(gym.Env):
         truncated = not terminated and self.episode_steps >= self.max_episode_steps
         self.needs_reset = terminated or truncated
 
+        # 在写入 last_action 前，比较这一控制步和上一控制步的指令。
+        action_change = 0.0
+        if physics_steps:
+            action_change = float(np.mean(((action - self.last_action) / 2.0) ** 2))
         if reason == "numerical_error":
             # 无效状态无法构成观测。返回最近一次有效观测，并标记终止原因。
             obs = self.last_valid_obs.copy()
@@ -142,9 +174,47 @@ class Go2Env(gym.Env):
             obs = self._observation()
             self.last_valid_obs = obs.copy()
 
-        # 第 4 步先用每控制步的存活分跑通接口，详细站立奖励放到第 5 步。
-        reward = 0.0 if terminated else 1.0
-        return obs, reward, terminated, truncated, self._info(physics_steps, reason)
+        info = self._info(physics_steps, reason)
+        torque_cost = float(torque_cost_sum / physics_steps) if physics_steps else 0.0
+        info["mean_abs_torque_nm"] = float(torque_abs_sum / physics_steps) if physics_steps else 0.0
+        reward, raw_terms, weighted_terms = self._standing_reward(
+            obs, info, torque_cost, action_change
+        )
+        info["reward_raw"] = raw_terms
+        info["reward_weighted"] = weighted_terms
+        return obs, reward, terminated, truncated, info
+
+    def _standing_reward(self, obs, info, torque_cost, action_change):
+        """用控制步末状态和子步力矩计算分项奖励。"""
+        reason = info["termination_reason"]
+        raw = {"alive": float(reason is None), "failure": float(reason is not None)}
+        if reason == "numerical_error":
+            raw.update(upright=None, height=None, body_motion=None, torque=None, action_change=None)
+        else:
+            height_error = (info["base_height"] - self.home_height) / HEIGHT_REWARD_WIDTH
+            speed_cost = (
+                np.sum((obs[:3] / LINEAR_SPEED_SCALE) ** 2, dtype=np.float64)
+                + np.sum((obs[3:6] / ANGULAR_SPEED_SCALE) ** 2, dtype=np.float64)
+            )
+            raw.update(
+                upright=float(np.clip(info["upright"], 0, 1) ** 2),
+                height=float(np.exp(-height_error ** 2)),
+                body_motion=float(speed_cost / (1 + speed_cost)),
+                torque=torque_cost,
+                action_change=action_change,
+            )
+
+        # 站立分按实际仿真时长折算。失败只扣一次，不随控制周期变化。
+        duration_scale = info["physics_steps"] * self.model.opt.timestep / REWARD_REFERENCE_DT
+        weighted = {}
+        for name, weight in REWARD_WEIGHTS.items():
+            if name == "failure":
+                weighted[name] = weight * raw[name]
+            elif reason is None:
+                weighted[name] = weight * raw[name] * duration_scale
+            else:
+                weighted[name] = 0.0
+        return float(sum(weighted.values())), raw, weighted
 
     def _observation(self):
         return get_observation(
