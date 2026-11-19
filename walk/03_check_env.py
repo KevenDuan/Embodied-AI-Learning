@@ -27,6 +27,30 @@ def run_demo(env, name, action_fn):
             return obs, terminated, truncated
 
 
+def check_standing_reward():
+    env = Go2Env(reset_noise_scale=0)
+    zero = np.zeros(12, dtype=np.float32)
+    scores = []
+    for name, height, tilt_deg in (("站立", env.home_height, 0),
+                                   ("倾斜", env.home_height, 35),
+                                   ("低矮倒地", env.min_base_height - 0.01, 0)):
+        env.reset(seed=0)
+        start = env.base_qpos_id
+        env.data.qpos[start + 2] = height
+        mujoco.mju_quatIntegrate(env.data.qpos[start + 3:start + 7],
+                                np.array([1.0, 0.0, 0.0]), np.deg2rad(tilt_deg))
+        _, reward, terminated, _, info = env.step(zero)
+        raw = info["reward_raw"]
+        np.testing.assert_allclose(reward, sum(info["reward_weighted"].values()))
+        assert terminated == (name == "低矮倒地")
+        scores.append(reward)
+        weighted = {key: round(value, 4) for key, value in info["reward_weighted"].items()}
+        print(f"{name}奖励 {reward:.4f}，直立原始值 {raw['upright']:.4f}，"
+              f"高度原始值 {raw['height']:.4f}，加权分项 {weighted}")
+    assert scores[0] > scores[1] > scores[2]
+    env.close()
+
+
 def main():
     env = Go2Env(max_episode_steps=150)
     check_env(env)
@@ -67,6 +91,7 @@ def main():
     assert 0 < info["physics_steps"] < env.decimation
     print(f"跌倒检查通过：仅执行 {info['physics_steps']}/{env.decimation} 个物理步")
     env.close()
+    check_standing_reward()
 
 
 if __name__ == "__main__":
