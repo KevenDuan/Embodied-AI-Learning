@@ -17,27 +17,15 @@ import mujoco
 import numpy as np
 
 if __package__:
-    from .go2_observation import get_observation
+    from .go2_observation import OBS_FIELDS, get_observation
 else:
-    from go2_observation import get_observation
+    from go2_observation import OBS_FIELDS, get_observation
 
 
 KP = 200.0
 KD = 5.0
 FREQUENCY_HZ = 0.5
 JOINT_INDEX = 1  # 按执行器顺序：FR_thigh_joint
-
-# 先保留原始单位，方便理解数值；后续再研究观测归一化。
-OBS_FIELDS = (
-    ("机身线速度 (m/s)", slice(0, 3)),
-    ("机身角速度 (rad/s)", slice(3, 6)),
-    ("机身中的重力单位方向", slice(6, 9)),
-    ("指令 vx, vy, yaw_rate (m/s, m/s, rad/s)", slice(9, 12)),
-    ("关节角度偏差 (rad)", slice(12, 24)),
-    ("关节速度 (rad/s)", slice(24, 36)),
-    ("上一步动作 (无量纲)", slice(36, 48)),
-)
-
 
 def print_observation(sim_time, obs):
     print(f"\n仿真时间 {sim_time:.3f} s，shape={obs.shape}，dtype={obs.dtype}")
